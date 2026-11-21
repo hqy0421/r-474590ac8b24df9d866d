@@ -35,6 +35,16 @@ class InvalidInputValue(GSpreadException):
     """The provided values is incorrect."""
 
 
+class NoFeasibleRegion(GSpreadException):
+    """No rectangle matches the requested constraints.
+
+    Raised by the bounded search mode of :meth:`gspread.worksheet.Worksheet.expand`
+    when the given A1 window does not contain a single rectangle that contains
+    all the anchors, avoids every excluded range and stays within the blank
+    budget.
+    """
+
+
 class APIError(GSpreadException):
     """Errors coming from the API itself,
     such as when we attempt to retrieve things that don't exist."""

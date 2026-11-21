@@ -17,6 +17,7 @@ from .client import Client
 from .exceptions import (
     GSpreadException,
     IncorrectCellLabel,
+    NoFeasibleRegion,
     NoValidUrlKeyFound,
     SpreadsheetNotFound,
     WorksheetNotFound,
@@ -57,6 +58,7 @@ __all__ = [
     # from .exceptions
     "GSpreadException",
     "IncorrectCellLabel",
+    "NoFeasibleRegion",
     "NoValidUrlKeyFound",
     "SpreadsheetNotFound",
     "WorksheetNotFound",

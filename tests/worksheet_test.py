@@ -2,6 +2,7 @@ import itertools
 import pickle  # nosec
 import random
 import re
+import unittest
 from inspect import signature
 from typing import Generator
 
@@ -2074,3 +2075,126 @@ class WorksheetTest(GspreadTest):
         # Further ensure we are able to access the exception's properties after pickling
         reloaded_exception = pickle.loads(pickle.dumps(ex.exception))  # nosec
         self.assertEqual(reloaded_exception.args[0]["status"], "INVALID_ARGUMENT")
+
+
+class ExpandBoundedModeTest(unittest.TestCase):
+    """Offline tests for the bounded mode of Worksheet.expand."""
+
+    SHEET_TITLE = "Vendors"
+
+    def _worksheet(self, matrix):
+        """Build a Worksheet whose get() returns a fixed matrix."""
+
+        class FakeWorksheet(Worksheet):
+            def __init__(self) -> None:
+                self._properties = {
+                    "sheetId": 1,
+                    "title": ExpandBoundedModeTest.SHEET_TITLE,
+                    "index": 0,
+                    "gridProperties": {"rowCount": 100, "columnCount": 26},
+                }
+                self.spreadsheet_id = "spreadsheet-id"
+                self._spreadsheet = None  # type: ignore[assignment]
+                self.matrix = matrix
+                self.calls: list = []
+
+            def get(self, range_name=None, **kwargs):
+                self.calls.append((range_name, kwargs))
+                return self.matrix
+
+        return FakeWorksheet()
+
+    SHEET = [
+        ["id", "name", "qty", "", "notes"],
+        ["1", "bolt", "4", "", "restock"],
+        ["2", "nut", "7", "", "ok"],
+    ]
+
+    def test_default_mode_keeps_original_behaviour(self):
+        sheet = self._worksheet([["a", "b"], ["c", "d"]])
+
+        result = sheet.expand("A1")
+
+        self.assertEqual(result, [["a", "b"], ["c", "d"]])
+        self.assertEqual(sheet.calls, [(None, {"pad_values": True})])
+
+    def test_bounded_mode_returns_absolute_range_and_matrix(self):
+        sheet = self._worksheet(self.SHEET)
+
+        result = sheet.expand(
+            mode="bounded",
+            window="A1:E3",
+            anchors="A1",
+            exclude="E1:E3",
+            max_blanks=1,
+        )
+
+        self.assertIsInstance(result, utils.BoundedTableResult)
+        self.assertEqual(result.a1_range, "'Vendors'!A1:C3")
+        self.assertEqual(
+            result.values,
+            [["id", "name", "qty"], ["1", "bolt", "4"], ["2", "nut", "7"]],
+        )
+        # The window is read once, as a sheet-qualified range, keeping the size.
+        self.assertEqual(
+            sheet.calls,
+            [("'Vendors'!A1:E3", {"maintain_size": True, "pad_values": True})],
+        )
+
+    def test_bounded_mode_accepts_enum(self):
+        sheet = self._worksheet(self.SHEET)
+        result = sheet.expand(
+            mode=utils.ExpandMode.bounded, window="A1:E3", anchors="A1", max_blanks=1
+        )
+        self.assertEqual(result.a1_range, "'Vendors'!A1:C3")
+
+    def test_bounded_mode_without_window(self):
+        sheet = self._worksheet(self.SHEET)
+        with self.assertRaises(gspread.exceptions.InvalidInputValue):
+            sheet.expand(mode="bounded", anchors="A1")
+        self.assertEqual(sheet.calls, [])
+
+    def test_plain_window_without_mode_selects_bounded(self):
+        sheet = self._worksheet(self.SHEET)
+        result = sheet.expand(window="A1:E3", anchors="A1", max_blanks=1)
+        self.assertEqual(result.a1_range, "'Vendors'!A1:C3")
+
+    def test_first_positional_argument_can_be_the_window(self):
+        sheet = self._worksheet(self.SHEET)
+        result = sheet.expand("A1:E3", anchors="A1", max_blanks=1)
+        self.assertEqual(result.a1_range, "'Vendors'!A1:C3")
+        self.assertEqual(
+            sheet.calls,
+            [("'Vendors'!A1:E3", {"maintain_size": True, "pad_values": True})],
+        )
+
+    def test_bounded_mode_with_unbounded_window(self):
+        sheet = self._worksheet(self.SHEET)
+        with self.assertRaises(gspread.exceptions.InvalidInputValue):
+            sheet.expand(mode="bounded", window="A1:H", anchors="A1")
+        self.assertEqual(sheet.calls, [])
+
+    def test_bounded_mode_without_anchor(self):
+        sheet = self._worksheet(self.SHEET)
+        with self.assertRaises(gspread.NoFeasibleRegion):
+            sheet.expand(mode="bounded", window="A1:E3")
+        self.assertEqual(sheet.calls, [])
+
+    def test_bounded_mode_without_feasible_region(self):
+        sheet = self._worksheet(self.SHEET)
+        with self.assertRaises(gspread.NoFeasibleRegion):
+            sheet.expand(mode="bounded", window="A1:E3", anchors="A1", exclude="A1:A3")
+
+    def test_unknown_mode(self):
+        sheet = self._worksheet(self.SHEET)
+        with self.assertRaises(gspread.exceptions.InvalidInputValue):
+            sheet.expand(mode="surrounded", window="A1:E3", anchors="A1")
+
+    def test_pickling_result(self):
+        sheet = self._worksheet(self.SHEET)
+        result = sheet.expand(
+            mode="bounded", window="A1:E3", anchors="A1", max_blanks=1
+        )
+        reloaded = pickle.loads(pickle.dumps(result))  # nosec
+        self.assertEqual(reloaded.a1_range, result.a1_range)
+        self.assertEqual(reloaded.values, result.values)

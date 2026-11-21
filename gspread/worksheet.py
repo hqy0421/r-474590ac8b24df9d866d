@@ -30,12 +30,14 @@ from typing import (
 )
 
 from .cell import Cell
-from .exceptions import GSpreadException
+from .exceptions import GSpreadException, InvalidInputValue, NoFeasibleRegion
 from .http_client import DefaultSerializerType, HTTPClient, ParamsType
 from .urls import WORKSHEET_DRIVE_URL
 from .utils import (
+    BoundedTableResult,
     DateTimeOption,
     Dimension,
+    ExpandMode,
     GridRangeType,
     InsertDataOption,
     MergeType,
@@ -46,6 +48,8 @@ from .utils import (
     ValidationConditionType,
     ValueInputOption,
     ValueRenderOption,
+    _as_range_list,
+    _parse_bounded_window,
     a1_range_to_grid_range,
     a1_to_rowcol,
     absolute_range_name,
@@ -55,6 +59,7 @@ from .utils import (
     convert_colors_to_hex_value,
     convert_hex_to_colors_dict,
     fill_gaps,
+    find_bounded_table,
     find_table,
     finditem,
     get_a1_from_absolute_range,
@@ -3642,7 +3647,12 @@ class Worksheet:
         self,
         top_left_range_name: str = "A1",
         direction: TableDirection = TableDirection.table,
-    ) -> List[List[str]]:
+        mode: Optional[ExpandMode] = None,
+        window: Optional[str] = None,
+        anchors: Optional[Union[str, Iterable[str]]] = None,
+        exclude: Optional[Union[str, Iterable[str]]] = None,
+        max_blanks: Optional[int] = 0,
+    ) -> Union[List[List[str]], BoundedTableResult]:
         """Expands a cell range based on non-null adjacent cells.
 
         Expand can be done in 3 directions defined in :class:`~gspread.utils.TableDirection`
@@ -3670,6 +3680,61 @@ class Worksheet:
                 ['B3', 'C3'],
             ]
 
+        Bounded mode
+        ~~~~~~~~~~~~
+
+        Set ``mode="bounded"`` (or :attr:`~gspread.utils.ExpandMode.bounded`) to
+        search a finite window instead of walking to the first empty cell. This
+        mode is meant for reports whose borders are irregular: a few empty
+        cells may appear inside the detail rows and other areas of the sheet
+        (totals, notes...) must be left out.
+
+        In bounded mode the method reads exactly ``window`` and returns the
+        largest rectangle that:
+
+        * contains every cell listed in ``anchors`` (those cells must be filled);
+        * does not overlap any range listed in ``exclude``;
+        * contains at most ``max_blanks`` empty cells (``None`` = no limit).
+
+        Empty strings and missing cells count as empty, ``0`` and ``False``
+        count as filled. Rectangles are ranked by largest area, then fewest
+        empty cells, then by earliest coordinates in the order top, left,
+        bottom, right.
+
+        The bounds are not found by brute force over four boundaries: the
+        window is searched in ``O(min(rows, cols) ** 2 * max(rows, cols))``
+        time (see :func:`gspread.utils.find_bounded_table`).
+
+        Returns a :class:`~gspread.utils.BoundedTableResult`, a
+        ``(a1_range, values)`` tuple whose ``a1_range`` is a sheet-qualified
+        absolute range and whose ``values`` is the raw matrix of the rectangle.
+        When no rectangle satisfies the constraints,
+        :class:`~gspread.exceptions.NoFeasibleRegion` is raised.
+
+        The default mode (``mode=None``) keeps the original behaviour and
+        returns a plain matrix.
+
+        .. code:: python
+
+            result = worksheet.expand(
+                mode="bounded",
+                window="A1:H60",
+                anchors="B2",
+                exclude=["H1:H60", "F40:G60"],
+                max_blanks=3,
+            )
+            result.a1_range  # "'Sheet1'!A1:G39"
+            result.values    # the raw cells of that range
+
+            # passing a window without a mode selects bounded mode as well
+            worksheet.expand(window="A1:H60", anchors="B2")
+
+        .. note::
+
+            in bounded mode a missing ``window`` falls back to
+            ``top_left_range_name`` when it is not the default ``"A1"``. This
+            keeps ``worksheet.expand("A1:H60", anchors="B2")`` working, although
+            the explicit ``window`` parameter is clearer.
 
         .. note::
 
@@ -3684,9 +3749,76 @@ class Worksheet:
             :func:`gspread.utils.find_table` to extract the desired table.
 
         :param str top_left_range_name: the top left corner of the table to expand.
-        :param gspread.utils.TableDirection direction: the expand direction
-        :rtype list(list): the resulting matrix
+            Ignored in bounded mode, where ``window`` defines the explored area.
+        :param gspread.utils.TableDirection direction: the expand direction.
+            Ignored in bounded mode.
+        :param mode: (optional) ``None`` for the original behaviour or ``"bounded"``.
+        :type mode: :class:`~gspread.utils.ExpandMode` or str
+        :param str window: (required in bounded mode) the finite A1 window to search.
+        :param anchors: (optional) an A1 cell or a list of A1 cells that the
+            result must contain. In bounded mode with no anchors,
+            :class:`~gspread.exceptions.NoFeasibleRegion` is raised.
+        :param exclude: (optional) an A1 range or a list of A1 ranges the
+            result must avoid.
+        :param int max_blanks: (optional) the maximum number of empty cells
+            inside the result. Defaults to ``0``. Use ``None`` for no limit.
+        :rtype: list(list) or gspread.utils.BoundedTableResult
         """
 
-        values = self.get(pad_values=True)
-        return find_table(values, top_left_range_name, direction)
+        if mode is None:
+            bounded_requested = (
+                window is not None or anchors is not None or exclude is not None
+            )
+            if not bounded_requested:
+                # No bounded arguments: keep the original behaviour untouched.
+                values = self.get(pad_values=True)
+                return find_table(values, top_left_range_name, direction)
+            # Bounded arguments without an explicit mode select the bounded
+            # search, since the original code has none of these parameters.
+            mode = ExpandMode.bounded
+
+        if not isinstance(mode, ExpandMode):
+            try:
+                mode = ExpandMode(str(mode).upper())
+            except ValueError:
+                raise InvalidInputValue(
+                    "mode must be None or 'bounded', got: {!r}".format(mode)
+                )
+
+        if mode is not ExpandMode.bounded:  # pragma: no cover - future modes
+            raise InvalidInputValue("unsupported expand mode: {!r}".format(mode))
+
+        # In bounded mode the first positional argument may carry the window,
+        # for calls written before the explicit ``window`` parameter existed.
+        if window is None and top_left_range_name != "A1":
+            window = top_left_range_name
+
+        if window is None:
+            raise InvalidInputValue(
+                "bounded mode requires a finite A1 window such as 'A1:H60'"
+            )
+
+        if not _as_range_list(anchors):
+            raise NoFeasibleRegion(
+                "bounded mode requires at least one anchor, no rectangle can be "
+                "anchored without one."
+            )
+
+        # Validate and normalize the window before spending an API request.
+        top, left, bottom, right = _parse_bounded_window(window)
+        window = "{}:{}".format(rowcol_to_a1(top, left), rowcol_to_a1(bottom, right))
+
+        window_range = absolute_range_name(self.title, window)
+        values = self.get(window_range, maintain_size=True, pad_values=True)
+
+        result = find_bounded_table(
+            values,
+            window=window,
+            anchors=anchors,
+            exclude=exclude,
+            max_blanks=max_blanks,
+        )
+
+        return BoundedTableResult(
+            absolute_range_name(self.title, result.a1_range), result.values
+        )

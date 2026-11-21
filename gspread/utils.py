@@ -8,6 +8,7 @@ This module contains utility functions.
 
 import enum
 import re
+from bisect import bisect_left
 from collections import defaultdict
 from collections.abc import Sequence
 from functools import wraps
@@ -32,7 +33,12 @@ from google.auth.credentials import Credentials as Credentials
 from google.oauth2.credentials import Credentials as UserCredentials
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 
-from .exceptions import IncorrectCellLabel, InvalidInputValue, NoValidUrlKeyFound
+from .exceptions import (
+    IncorrectCellLabel,
+    InvalidInputValue,
+    NoFeasibleRegion,
+    NoValidUrlKeyFound,
+)
 
 if TYPE_CHECKING:
     from .cell import Cell
@@ -173,6 +179,17 @@ class TableDirection(StrEnum):
     table = "TABLE"
     down = "DOWN"
     right = "RIGHT"
+
+
+class ExpandMode(StrEnum):
+    """Modes accepted by :meth:`gspread.worksheet.Worksheet.expand`.
+
+    * ``ExpandMode.bounded``: search the largest rectangle inside a finite A1
+      window that contains the given anchors, avoids every excluded range and
+      stays within the blank budget. See :func:`find_bounded_table`.
+    """
+
+    bounded = "BOUNDED"
 
 
 def convert_credentials(credentials: Credentials) -> Credentials:
@@ -1123,6 +1140,676 @@ def find_table(
         result.append(rows[col : rightMost + 1])
 
     return result
+
+
+class BoundedTableResult(tuple):
+    """Result of :func:`find_bounded_table`.
+
+    It is a two-item tuple ``(a1_range, values)`` and can be unpacked as such,
+    while also exposing named access:
+
+    * :attr:`a1_range` (alias :attr:`range`): the A1 notation of the found
+      rectangle, e.g. ``"B2:D5"``. :meth:`gspread.worksheet.Worksheet.expand`
+      returns a sheet-qualified absolute range such as ``"'Sheet1'!B2:D5"``.
+    * :attr:`values` (alias :attr:`matrix`): the raw cells of the rectangle,
+      copied from the window matrix that was searched.
+
+    Dictionary-style access is supported as well: ``result["range"]`` and
+    ``result["values"]``.
+    """
+
+    __slots__ = ()
+
+    def __new__(cls, a1_range: str, values: List[List[Any]]) -> "BoundedTableResult":
+        return tuple.__new__(cls, (a1_range, values))
+
+    @property
+    def a1_range(self) -> str:
+        return tuple.__getitem__(self, 0)
+
+    @property
+    def range(self) -> str:
+        return tuple.__getitem__(self, 0)
+
+    @property
+    def values(self) -> List[List[Any]]:
+        return tuple.__getitem__(self, 1)
+
+    @property
+    def matrix(self) -> List[List[Any]]:
+        return tuple.__getitem__(self, 1)
+
+    @property
+    def area(self) -> int:
+        matrix = self.values
+        return len(matrix) * (len(matrix[0]) if matrix else 0)
+
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, str):
+            if key in ("range", "a1_range", "a1"):
+                return tuple.__getitem__(self, 0)
+            if key in ("values", "matrix", "data"):
+                return tuple.__getitem__(self, 1)
+            raise KeyError(key)
+        return tuple.__getitem__(self, key)
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Return the result as ``{"range": ..., "values": ...}``."""
+        return {"range": self.a1_range, "values": self.values}
+
+    def __repr__(self) -> str:
+        return "BoundedTableResult(a1_range={!r}, values={!r})".format(
+            self.a1_range, self.values
+        )
+
+    def __reduce__(self) -> Tuple[Any, Tuple[str, List[List[Any]]]]:
+        return self.__class__, (self.a1_range, self.values)
+
+
+def _is_blank_cell(value: Any) -> bool:
+    """Return True for empty strings and missing cells.
+
+    ``0`` and ``False`` are real values and count as filled.
+    """
+    return value is None or value == ""
+
+
+def _as_range_list(value: Optional[Union[str, Iterable[str]]]) -> List[str]:
+    """Normalize a single A1 label or an iterable of labels into a list."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value else []
+    return [item for item in value if item]
+
+
+def _parse_bounded_window(window: str) -> Tuple[int, int, int, int]:
+    """Parse a finite A1 window into inclusive 1-based (top, left, bottom, right).
+
+    Unbounded windows like ``"A1:H"`` are rejected: the whole point of the
+    bounded search is to never look outside the window given by the caller.
+    """
+    a1 = get_a1_from_absolute_range(window)
+    if not a1 or "!" in a1:
+        raise InvalidInputValue("window must be an A1 range, got: {!r}".format(window))
+    try:
+        grid = a1_range_to_grid_range(a1)
+    except IncorrectCellLabel:
+        raise InvalidInputValue(
+            "window must be a valid A1 range, got: {!r}".format(window)
+        )
+
+    required = (
+        "startRowIndex",
+        "endRowIndex",
+        "startColumnIndex",
+        "endColumnIndex",
+    )
+    if not all(key in grid for key in required):
+        raise InvalidInputValue(
+            "window must have four finite boundaries, got: {!r}".format(window)
+        )
+
+    top = grid["startRowIndex"] + 1
+    left = grid["startColumnIndex"] + 1
+    bottom = grid["endRowIndex"]
+    right = grid["endColumnIndex"]
+
+    if top > bottom or left > right:
+        raise InvalidInputValue("window is empty: {!r}".format(window))
+
+    return top, left, bottom, right
+
+
+def _clip_exclusion(
+    range_label: str,
+    top: int,
+    left: int,
+    bottom: int,
+    right: int,
+) -> Optional[Tuple[int, int, int, int]]:
+    """Clip an A1 exclusion range to the window.
+
+    Return zero-based, window-relative ``(row_start, row_end, col_start,
+    col_end)`` half-open indexes, or ``None`` when the exclusion is entirely
+    outside the window. Unbounded exclusion ranges (e.g. ``"E:J"``) are
+    clipped to the window boundaries.
+    """
+    a1 = get_a1_from_absolute_range(range_label)
+    try:
+        grid = a1_range_to_grid_range(a1)
+    except IncorrectCellLabel:
+        raise InvalidInputValue(
+            "excluded range must be a valid A1 range, got: {!r}".format(range_label)
+        )
+
+    window_row_start = top - 1
+    window_col_start = left - 1
+
+    row_start = max(grid.get("startRowIndex", window_row_start), window_row_start)
+    row_end = min(grid.get("endRowIndex", bottom), bottom)
+    col_start = max(grid.get("startColumnIndex", window_col_start), window_col_start)
+    col_end = min(grid.get("endColumnIndex", right), right)
+
+    if row_start >= row_end or col_start >= col_end:
+        return None
+
+    return (
+        row_start - window_row_start,
+        row_end - window_row_start,
+        col_start - window_col_start,
+        col_end - window_col_start,
+    )
+
+
+def _parse_anchor(
+    anchor: str, top: int, left: int, bottom: int, right: int
+) -> Tuple[int, int]:
+    """Parse an anchor cell into window-relative zero-based ``(row, col)``."""
+    a1 = get_a1_from_absolute_range(anchor)
+    if ":" in a1 or not a1:
+        raise InvalidInputValue(
+            "an anchor must be a single cell, got: {!r}".format(anchor)
+        )
+    try:
+        row, col = a1_to_rowcol(a1)
+    except IncorrectCellLabel:
+        raise InvalidInputValue(
+            "an anchor must be a valid A1 cell, got: {!r}".format(anchor)
+        )
+
+    if not (top <= row <= bottom and left <= col <= right):
+        raise InvalidInputValue(
+            "anchor {!r} is outside window {}:{}".format(
+                anchor,
+                rowcol_to_a1(top, left),
+                rowcol_to_a1(bottom, right),
+            )
+        )
+
+    return row - top, col - left
+
+
+def _normalize_matrix(values: List[List[Any]], rows: int, cols: int) -> List[List[Any]]:
+    """Build an exact ``rows`` x ``cols`` matrix, missing cells become ``""``."""
+    matrix: List[List[Any]] = []
+    for row_index in range(rows):
+        source = values[row_index] if row_index < len(values) else []
+        matrix.append(
+            [
+                source[col_index] if col_index < len(source) else ""
+                for col_index in range(cols)
+            ]
+        )
+    return matrix
+
+
+def _best_span(
+    blank_counts: List[int],
+    excluded_counts: List[int],
+    required_span: Tuple[int, int],
+    max_blanks: float,
+) -> Optional[Tuple[int, int, int]]:
+    """Find the best contiguous valid column span for one row band.
+
+    ``blank_counts`` and ``excluded_counts`` are per-column totals for the
+    band. Columns whose ``excluded_counts`` is not zero can not be part of any
+    rectangle. ``required_span`` is the inclusive ``(first, last)`` column that
+    the span must cover (anchors).
+
+    Return ``(width, blanks, span_start)`` for the best span, or ``None``.
+    Spans are ranked by largest width, then fewest blanks, then earliest start.
+    """
+    width_total = len(blank_counts)
+    best: Optional[Tuple[int, int, int]] = None
+    run_start = 0
+
+    while run_start < width_total:
+        if excluded_counts[run_start] > 0:
+            run_start += 1
+            continue
+
+        run_end = run_start
+        while run_end < width_total and excluded_counts[run_end] == 0:
+            run_end += 1
+
+        candidate = _best_span_in_run(
+            blank_counts, run_start, run_end, required_span, max_blanks
+        )
+        if candidate is not None:
+            key = (-candidate[0], candidate[1], candidate[2])
+            if best is None or key < (-best[0], best[1], best[2]):
+                best = candidate
+
+        run_start = run_end
+
+    return best
+
+
+def _best_span_in_run(
+    blank_counts: List[int],
+    run_start: int,
+    run_end: int,
+    required_span: Tuple[int, int],
+    max_blanks: float,
+) -> Optional[Tuple[int, int, int]]:
+    """Best span inside one contiguous run of usable columns ``[start, end)``.
+
+    For every possible right edge the leftmost valid left edge is found with a
+    binary search over the prefix sums: it is the first position where the
+    blank total is still within budget. That leftmost position gives both the
+    widest span ending there and, among those, the earliest start.
+    """
+    first_needed, last_needed = required_span
+    if first_needed < run_start or last_needed >= run_end:
+        return None
+
+    # prefix[i] = blanks in blank_counts[run_start:run_start + i]
+    prefix = [0]
+    for col in range(run_start, run_end):
+        prefix.append(prefix[-1] + blank_counts[col])
+
+    best: Optional[Tuple[int, int, int]] = None
+
+    # A valid span must cover [first_needed, last_needed], so the right edge
+    # can not end before last_needed.
+    for right in range(last_needed, run_end):
+        # blanks in [left, right] are prefix[right + 1 - run_start] - prefix[left - run_start]
+        #
+        # find the smallest left in [run_start, first_needed] such that the
+        # total is within budget: prefix[right + 1 - run_start] -
+        # prefix[left - run_start] <= max_blanks
+        #
+        # i.e. prefix[left - run_start] >= prefix[right + 1 - run_start] - max_blanks
+        target = prefix[right + 1 - run_start] - max_blanks
+        offset = max(0, bisect_left(prefix, target))
+        left = run_start + offset
+
+        if left > min(first_needed, right):
+            # no valid left edge for this right edge (the span would be empty
+            # or would start after the anchor)
+            continue
+
+        width = right - left + 1
+        blanks = prefix[right + 1 - run_start] - prefix[offset]
+        candidate = (width, blanks, left)
+        if best is None or (-width, blanks, left) < (-best[0], best[1], best[2]):
+            best = candidate
+
+    return best
+
+
+def _orient_grid(
+    blank: List[List[bool]],
+    excluded: List[List[bool]],
+    anchors: List[Tuple[int, int]],
+) -> Tuple[bool, List[List[bool]], List[List[bool]], List[int], List[int]]:
+    """Use the shorter window side as the "band" axis.
+
+    Return ``(transposed, band_blank, band_excluded, anchor_bands,
+    anchor_spans)``.
+    """
+    rows = len(blank)
+    cols = len(blank[0]) if rows else 0
+
+    if rows > cols:
+        band_blank = [
+            [blank[span][band] for span in range(rows)] for band in range(cols)
+        ]
+        band_excluded = [
+            [excluded[span][band] for span in range(rows)] for band in range(cols)
+        ]
+        return (
+            True,
+            band_blank,
+            band_excluded,
+            [anchor[1] for anchor in anchors],
+            [anchor[0] for anchor in anchors],
+        )
+
+    return (
+        False,
+        blank,
+        excluded,
+        [anchor[0] for anchor in anchors],
+        [anchor[1] for anchor in anchors],
+    )
+
+
+def _band_overlaps_anchor_exclusion(
+    excluded_counts: List[int], anchor_spans: List[int]
+) -> bool:
+    """True when any anchor column is excluded for the current row band."""
+    return any(excluded_counts[span] > 0 for span in anchor_spans)
+
+
+def _accumulate_band(
+    band_blank: List[List[bool]],
+    band_excluded: List[List[bool]],
+    band_end: int,
+    blank_counts: List[int],
+    excluded_counts: List[int],
+) -> None:
+    """Add one row band to the per-column totals, in place."""
+    blanks_row = band_blank[band_end]
+    excluded_row = band_excluded[band_end]
+
+    for span in range(len(blanks_row)):
+        if blanks_row[span]:
+            blank_counts[span] += 1
+        if excluded_row[span]:
+            excluded_counts[span] += 1
+
+
+def _consider_band(
+    transposed: bool,
+    band_start: int,
+    band_end: int,
+    blank_counts: List[int],
+    excluded_counts: List[int],
+    anchor_spans: List[int],
+    required_span: Tuple[int, int],
+    max_blanks: float,
+    best: Optional[
+        Tuple[Tuple[int, int, int, int, int, int], Tuple[int, int, int, int, int]]
+    ],
+) -> Optional[
+    Tuple[Tuple[int, int, int, int, int, int], Tuple[int, int, int, int, int]]
+]:
+    """Evaluate one row band and keep the best rectangle so far."""
+    if _band_overlaps_anchor_exclusion(excluded_counts, anchor_spans):
+        return best
+
+    span_best = _best_span(blank_counts, excluded_counts, required_span, max_blanks)
+    if span_best is None:
+        return best
+
+    width, blanks, span_start = span_best
+    rect = _to_original_rect(
+        transposed, band_start, band_end, span_start, span_start + width - 1
+    )
+    key = _rect_key(rect, blanks)
+    if best is None or key < best[0]:
+        return key, (rect[0], rect[1], rect[2], rect[3], blanks)
+
+    return best
+
+
+def _search_bounded(
+    blank: List[List[bool]],
+    excluded: List[List[bool]],
+    anchors: List[Tuple[int, int]],
+    max_blanks: float,
+) -> Optional[Tuple[int, int, int, int, int]]:
+    """Search the best rectangle in a boolean grid.
+
+    The two outer boundaries are enumerated along the shorter axis and the
+    remaining span is solved in linear time, so the search is
+    ``O(min(rows, cols) ** 2 * max(rows, cols))`` instead of enumerating four
+    boundaries (``O(rows ** 2 * cols ** 2)``).
+
+    Return zero-based inclusive ``(top, left, bottom, right, blanks)`` or
+    ``None``.
+    """
+    rows = len(blank)
+    cols = len(blank[0]) if rows else 0
+    if rows == 0 or cols == 0 or not anchors:
+        return None
+
+    (
+        transposed,
+        band_blank,
+        band_excluded,
+        anchor_bands,
+        anchor_spans,
+    ) = _orient_grid(blank, excluded, anchors)
+
+    band_count = len(band_blank)
+    span_count = len(band_blank[0]) if band_count else 0
+
+    first_anchor_band = min(anchor_bands)
+    last_anchor_band = max(anchor_bands)
+    required_span = (min(anchor_spans), max(anchor_spans))
+
+    best: Optional[
+        Tuple[Tuple[int, int, int, int, int, int], Tuple[int, int, int, int, int]]
+    ] = None
+
+    for band_start in range(first_anchor_band + 1):
+        blank_counts = [0] * span_count
+        excluded_counts = [0] * span_count
+
+        for band_end in range(band_start, band_count):
+            _accumulate_band(
+                band_blank, band_excluded, band_end, blank_counts, excluded_counts
+            )
+
+            if band_end < last_anchor_band:
+                continue
+
+            best = _consider_band(
+                transposed,
+                band_start,
+                band_end,
+                blank_counts,
+                excluded_counts,
+                anchor_spans,
+                required_span,
+                max_blanks,
+                best,
+            )
+
+    return None if best is None else best[1]
+
+
+def _to_original_rect(
+    transposed: bool, band_start: int, band_end: int, span_start: int, span_end: int
+) -> Tuple[int, int, int, int]:
+    """Map an internal band/span rectangle back to ``(top, left, bottom, right)``."""
+    if transposed:
+        return span_start, band_start, span_end, band_end
+    return band_start, span_start, band_end, span_end
+
+
+def _rect_key(
+    rect: Tuple[int, int, int, int], blanks: int
+) -> Tuple[int, int, int, int, int, int]:
+    """Ranking key: largest area, then fewest blanks, then top/left/bottom/right."""
+    top, left, bottom, right = rect
+    area = (bottom - top + 1) * (right - left + 1)
+    return (-area, blanks, top, left, bottom, right)
+
+
+def _validate_blank_budget(max_blanks: Optional[int]) -> float:
+    """Validate ``max_blanks`` and return it as a comparable number."""
+    if max_blanks is None:
+        return float("inf")
+    if isinstance(max_blanks, bool) or not isinstance(max_blanks, int):
+        raise InvalidInputValue(
+            "max_blanks must be an integer or None, got: {!r}".format(max_blanks)
+        )
+    if max_blanks < 0:
+        raise InvalidInputValue(
+            "max_blanks must be greater than or equal to 0, got: {!r}".format(
+                max_blanks
+            )
+        )
+    return max_blanks
+
+
+def _build_exclusion_grid(
+    exclude: List[str],
+    rows: int,
+    cols: int,
+    top: int,
+    left: int,
+    bottom: int,
+    right: int,
+) -> List[List[bool]]:
+    """Build a window-relative grid marking every excluded cell."""
+    excluded = [[False] * cols for _ in range(rows)]
+
+    for range_label in exclude:
+        clipped = _clip_exclusion(range_label, top, left, bottom, right)
+        if clipped is None:
+            continue
+        row_start, row_end, col_start, col_end = clipped
+        for row_index in range(row_start, row_end):
+            row = excluded[row_index]
+            for col_index in range(col_start, col_end):
+                row[col_index] = True
+
+    return excluded
+
+
+def _build_anchor_cells(
+    anchors: List[str],
+    blank: List[List[bool]],
+    top: int,
+    left: int,
+    bottom: int,
+    right: int,
+) -> List[Tuple[int, int]]:
+    """Parse and validate anchors, refusing empty ones."""
+    anchor_cells = [
+        _parse_anchor(anchor, top, left, bottom, right) for anchor in anchors
+    ]
+
+    for anchor_row, anchor_col in anchor_cells:
+        if blank[anchor_row][anchor_col]:
+            raise NoFeasibleRegion(
+                "anchor {} is empty, no rectangle can contain a non-empty anchor".format(
+                    rowcol_to_a1(top + anchor_row, left + anchor_col)
+                )
+            )
+
+    return anchor_cells
+
+
+def _build_bounded_result(
+    matrix: List[List[Any]],
+    rect: Tuple[int, int, int, int, int],
+    top: int,
+    left: int,
+) -> BoundedTableResult:
+    """Build the result from a window-relative rectangle."""
+    rect_top, rect_left, rect_bottom, rect_right, _blanks = rect
+    first_cell = rowcol_to_a1(top + rect_top, left + rect_left)
+    last_cell = rowcol_to_a1(top + rect_bottom, left + rect_right)
+    a1_range = (
+        first_cell if first_cell == last_cell else "{}:{}".format(first_cell, last_cell)
+    )
+
+    rect_values = [
+        row[rect_left : rect_right + 1] for row in matrix[rect_top : rect_bottom + 1]
+    ]
+
+    return BoundedTableResult(a1_range, rect_values)
+
+
+def find_bounded_table(
+    values: List[List[Any]],
+    window: str,
+    anchors: Optional[Union[str, Iterable[str]]] = None,
+    exclude: Optional[Union[str, Iterable[str]]] = None,
+    max_blanks: Optional[int] = 0,
+) -> BoundedTableResult:
+    """Find the largest rectangle inside a finite A1 window.
+
+    Unlike :func:`find_table`, which walks from a corner until the first empty
+    cell, this search accepts a small number of empty cells and works with
+    obstacles:
+
+    * the rectangle must contain every ``anchors`` cell, and those cells must
+      be filled;
+    * the rectangle must not overlap any range in ``exclude``;
+    * at most ``max_blanks`` empty cells may be inside the rectangle
+      (``None`` means no limit).
+
+    Empty strings and missing cells count as empty; ``0`` and ``False`` count
+    as filled.
+
+    Among all valid rectangles the one with the largest area wins. Ties are
+    broken by fewest empty cells, then by the earliest coordinates in the
+    order top, left, bottom, right.
+
+    The search does **not** enumerate all four boundaries. It enumerates the
+    top and bottom rows along the shorter axis and solves the columns in
+    linear time, which is ``O(min(rows, cols) ** 2 * max(rows, cols))``.
+
+    ``values`` must be the matrix read for ``window`` (window-relative, with
+    rows in the same order as the sheet). A ragged matrix is accepted; missing
+    cells are treated as empty.
+
+    Example::
+
+        >>> values = [
+        ...     ["id", "name", "qty", "", "notes"],
+        ...     ["1", "bolt", "4", "", "restock"],
+        ...     ["2", "", "7", "", "ok"],
+        ...     ["", "", "", "", ""],
+        ... ]
+        >>> find_bounded_table(
+        ...     values,
+        ...     "A1:E4",
+        ...     anchors="B1",
+        ...     exclude="E1:E4",
+        ...     max_blanks=2,
+        ... )
+        BoundedTableResult(a1_range='A1:C3', values=[['id', 'name', 'qty'], ['1', 'bolt', '4'], ['2', '', '7']])
+
+    :param list[list] values: the window matrix.
+    :param str window: a finite A1 range, e.g. ``"B2:H20"``.
+    :param anchors: an A1 cell or an iterable of A1 cells that must be inside
+        the rectangle. Anchors outside the window raise
+        :class:`~gspread.exceptions.InvalidInputValue`; empty anchors mean
+        there is no feasible region.
+    :param exclude: an A1 range or an iterable of A1 ranges that the rectangle
+        must avoid. Unbounded ranges are clipped to the window.
+    :param int max_blanks: maximum number of empty cells inside the rectangle,
+        ``None`` for no limit.
+    :returns: the A1 range and the raw values of the found rectangle.
+    :rtype: :class:`BoundedTableResult`
+    :raises:
+        :class:`~gspread.exceptions.InvalidInputValue`: for malformed input.
+        :class:`~gspread.exceptions.NoFeasibleRegion`: when no rectangle
+        satisfies all the constraints.
+    """
+    top, left, bottom, right = _parse_bounded_window(window)
+    rows = bottom - top + 1
+    cols = right - left + 1
+
+    if not _as_range_list(anchors):
+        raise NoFeasibleRegion(
+            "at least one anchor is required: without an anchor there is no "
+            "rectangle to anchor the search on."
+        )
+
+    budget = _validate_blank_budget(max_blanks)
+    matrix = _normalize_matrix(values, rows, cols)
+    blank = [[_is_blank_cell(value) for value in row] for row in matrix]
+    excluded = _build_exclusion_grid(
+        _as_range_list(exclude), rows, cols, top, left, bottom, right
+    )
+    anchor_cells = _build_anchor_cells(
+        _as_range_list(anchors), blank, top, left, bottom, right
+    )
+
+    found = _search_bounded(blank, excluded, anchor_cells, budget)
+    if found is None:
+        raise NoFeasibleRegion(
+            "no rectangle inside window {}:{} contains all anchors ({}), "
+            "avoids the excluded ranges ({}) and stays within a blank budget "
+            "of {}.".format(
+                rowcol_to_a1(top, left),
+                rowcol_to_a1(bottom, right),
+                len(anchor_cells),
+                len(_as_range_list(exclude)),
+                "unlimited" if max_blanks is None else max_blanks,
+            )
+        )
+
+    return _build_bounded_result(matrix, found, top, left)
 
 
 # SHOULD NOT BE NEEDED UNTIL NEXT MAJOR VERSION

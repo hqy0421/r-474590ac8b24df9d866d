@@ -503,6 +503,57 @@ Using the below code will result in rows 2 to 4:
       ["Superman", "DC", "super human"],
    ]
 
+Extract a table with irregular borders
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The default ``expand`` stops on the first empty cell, which does not work for
+reports that have a few empty cells inside the detail rows, or that sit next to
+areas (totals, notes, filters) that must not be collected.
+
+Set ``mode="bounded"`` to search a finite A1 window instead. The largest
+rectangle is returned that:
+
+* contains every cell listed in ``anchors`` (those cells must hold a value);
+* does not overlap any range listed in ``exclude``;
+* contains at most ``max_blanks`` empty cells (``None`` means no limit).
+
+Empty strings and missing cells count as empty; ``0`` and ``False`` count as
+filled. Rectangles are ranked by largest area, then fewest empty cells, then by
+earliest coordinates in the order top, left, bottom, right.
+
+.. code:: python
+
+   result = worksheet.expand(
+       mode="bounded",
+       window="A1:H60",
+       anchors="B2",
+       exclude=["H1:H60", "F40:G60"],
+       max_blanks=3,
+   )
+
+   result.a1_range  # "'Sheet1'!A1:G39" (a sheet-qualified absolute A1 range)
+   result.values    # the raw matrix of that range
+
+``result`` is a ``(a1_range, values)`` tuple, so this also works:
+
+.. code:: python
+
+   a1_range, values = worksheet.expand(
+       mode="bounded", window="A1:H60", anchors="B2", max_blanks=3
+   )
+
+If nothing satisfies the constraints, :class:`~gspread.exceptions.NoFeasibleRegion`
+is raised. A window with missing boundaries (such as ``"A1:H"``), an anchor
+outside the window or an invalid A1 label raise
+:class:`~gspread.exceptions.InvalidInputValue`.
+
+The bounded search does not try every combination of the four boundaries: it
+walks the two boundaries along the shorter side of the window and solves the
+other side in linear time. The whole window is read with a single API request.
+
+The default ``expand`` call keeps its original behaviour and returns a plain
+matrix.
+
 
 
 Formatting

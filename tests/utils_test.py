@@ -2,6 +2,7 @@ import unittest
 
 import gspread
 import gspread.utils as utils
+from gspread.exceptions import InvalidInputValue, NoFeasibleRegion
 
 
 class UtilsTest(unittest.TestCase):
@@ -690,3 +691,276 @@ class UtilsTest(unittest.TestCase):
         table = utils.find_table(values, "A1", utils.TableDirection.table)
 
         self.assertListEqual(table, [], "resulting table should be empty")
+
+
+class FindBoundedTableTest(unittest.TestCase):
+    """Tests for utils.find_bounded_table."""
+
+    def test_requires_anchors(self):
+        values = [["a", "b"], ["c", "d"]]
+        with self.assertRaises(NoFeasibleRegion):
+            utils.find_bounded_table(values, "A1:B2", max_blanks=0)
+
+    def test_empty_anchor_is_not_feasible(self):
+        values = [["a", ""], ["c", "d"]]
+        with self.assertRaises(NoFeasibleRegion):
+            utils.find_bounded_table(values, "A1:B2", anchors="B1", max_blanks=5)
+
+    def test_anchor_outside_window(self):
+        values = [["a", "b"], ["c", "d"]]
+        with self.assertRaises(InvalidInputValue):
+            utils.find_bounded_table(values, "A1:B2", anchors="C3")
+
+    def test_invalid_window(self):
+        values = [["a", "b"], ["c", "d"]]
+        for window in ("A1:H", "", "not-a-range", "A1:B2:C3"):
+            with self.assertRaises(InvalidInputValue):
+                utils.find_bounded_table(values, window, anchors="A1")
+
+    def test_invalid_max_blanks(self):
+        values = [["a", "b"], ["c", "d"]]
+        for max_blanks in (-1, True, 1.5, "2"):
+            with self.assertRaises(InvalidInputValue):
+                utils.find_bounded_table(
+                    values, "A1:B2", anchors="A1", max_blanks=max_blanks
+                )
+
+    def test_grows_while_within_blank_budget(self):
+        """A rectangle may include a few empty cells when the budget allows it."""
+        values = [
+            ["id", "name", "qty"],
+            ["1", "bolt", "4"],
+            ["2", "", "7"],
+            ["", "", ""],
+            ["notes", "", ""],
+        ]
+        # budget 1: the empty cell inside the detail rows is allowed, but
+        # taking the "notes" row would need more empty cells.
+        result = utils.find_bounded_table(values, "A1:C5", anchors="A1", max_blanks=1)
+        self.assertEqual(result.a1_range, "A1:C3")
+        self.assertEqual(
+            result.values,
+            [["id", "name", "qty"], ["1", "bolt", "4"], ["2", "", "7"]],
+        )
+
+    def test_zero_budget_stops_on_empty_cell(self):
+        values = [
+            ["id", "name", "qty"],
+            ["1", "bolt", "4"],
+            ["2", "", "7"],
+        ]
+        result = utils.find_bounded_table(values, "A1:C3", anchors="A1", max_blanks=0)
+        self.assertEqual(result.a1_range, "A1:C2")
+
+    def test_none_budget_has_no_limit(self):
+        values = [
+            ["id", "name", "qty"],
+            ["1", "bolt", "4"],
+            ["2", "", "7"],
+            ["", "", ""],
+        ]
+        result = utils.find_bounded_table(
+            values, "A1:C4", anchors="A1", max_blanks=None
+        )
+        self.assertEqual(result.a1_range, "A1:C4")
+
+    def test_exclude_range_is_avoided(self):
+        values = [
+            ["id", "name", "qty", "notes"],
+            ["1", "bolt", "4", "restock"],
+            ["2", "nut", "7", "ok"],
+        ]
+        result = utils.find_bounded_table(
+            values, "A1:D3", anchors="A1", exclude="D1:D3", max_blanks=None
+        )
+        self.assertEqual(result.a1_range, "A1:C3")
+
+    def test_exclude_unbounded_range_is_clipped_to_window(self):
+        values = [
+            ["id", "name", "qty", "notes"],
+            ["1", "bolt", "4", "restock"],
+            ["2", "nut", "7", "ok"],
+        ]
+        result = utils.find_bounded_table(
+            values, "A1:D3", anchors="A1", exclude="D:D", max_blanks=None
+        )
+        self.assertEqual(result.a1_range, "A1:C3")
+
+    def test_exclude_outside_window_is_ignored(self):
+        values = [["a", "b"], ["c", "d"]]
+        result = utils.find_bounded_table(
+            values, "A1:B2", anchors="A1", exclude="Z1:Z9", max_blanks=None
+        )
+        self.assertEqual(result.a1_range, "A1:B2")
+
+    def test_exclude_splits_the_window(self):
+        values = [
+            ["a", "b", "x", "c", "d"],
+            ["a", "b", "x", "c", "d"],
+        ]
+        result = utils.find_bounded_table(
+            values, "A1:E2", anchors="A1", exclude="C1:C2", max_blanks=0
+        )
+        # the left block is 2x2, the right block is 2x1 -> the left wins
+        self.assertEqual(result.a1_range, "A1:B2")
+
+    def test_exclude_containing_anchor_is_not_feasible(self):
+        values = [["a", "b"], ["c", "d"]]
+        with self.assertRaises(NoFeasibleRegion):
+            utils.find_bounded_table(values, "A1:B2", anchors="A1", exclude="A1:A1")
+
+    def test_zero_and_false_count_as_filled(self):
+        values = [[0, False], ["", ""]]
+        result = utils.find_bounded_table(values, "A1:B2", anchors="A1", max_blanks=1)
+        self.assertEqual(result.a1_range, "A1:B1")
+        self.assertEqual(result.values, [[0, False]])
+
+    def test_missing_cells_count_as_empty(self):
+        values = [["a"], ["b"]]
+        result = utils.find_bounded_table(
+            values, "A1:C2", anchors="A1", max_blanks=None
+        )
+        self.assertEqual(result.values, [["a", "", ""], ["b", "", ""]])
+
+    def test_multiple_anchors_must_all_be_included(self):
+        values = [
+            ["a", "", "b"],
+            ["c", "d", "e"],
+        ]
+        result = utils.find_bounded_table(
+            values, "A1:C2", anchors=["A1", "C1"], max_blanks=1
+        )
+        self.assertEqual(result.a1_range, "A1:C2")
+        self.assertEqual(result.values, [["a", "", "b"], ["c", "d", "e"]])
+
+    def test_tie_break_fewest_blanks(self):
+        # B2:C3 is excluded, leaving A1:C1 (row, one blank) and A1:A3 (column,
+        # no blank). Both have area 3 and both start at the anchor A1; the
+        # blank-free one wins even though its bottom edge is later.
+        values = [
+            ["a", "", "c"],
+            ["a", "x", "y"],
+            ["a", "z", "w"],
+        ]
+        result = utils.find_bounded_table(
+            values,
+            "A1:C3",
+            anchors="A1",
+            exclude="B2:C3",
+            max_blanks=None,
+        )
+        self.assertEqual(result.area, 3)
+        self.assertEqual(result.a1_range, "A1:A3")
+        self.assertEqual(result.values, [["a"], ["a"], ["a"]])
+
+    def test_tie_break_earliest_coordinates(self):
+        # four disjoint filled blocks of the same size, top-left must win
+        values = [
+            ["a", "a", "", "b", "b"],
+            ["a", "a", "", "b", "b"],
+            ["", "", "", "", ""],
+            ["c", "c", "", "d", "d"],
+            ["c", "c", "", "d", "d"],
+        ]
+        result = utils.find_bounded_table(values, "A1:E5", anchors=["A1"], max_blanks=0)
+        self.assertEqual(result.a1_range, "A1:B2")
+
+    def test_window_offset(self):
+        # window starts at B2, so the returned range must use sheet coordinates
+        values = [
+            ["", "a", "b"],
+            ["", "c", "d"],
+        ]
+        result = utils.find_bounded_table(values, "B2:C3", anchors="C2")
+        self.assertEqual(result.a1_range, "C2:C3")
+        self.assertEqual(result.values, [["a"], ["c"]])
+
+    def test_absolute_window_with_sheet_name(self):
+        values = [["a", "b"], ["c", "d"]]
+        result = utils.find_bounded_table(values, "Sheet1!A1:B2", anchors="A1")
+        self.assertEqual(result.a1_range, "A1:B2")
+
+    def test_result_supports_named_and_tuple_access(self):
+        values = [["a", "b"], ["c", "d"]]
+        result = utils.find_bounded_table(values, "A1:B2", anchors="A1")
+
+        self.assertIsInstance(result, utils.BoundedTableResult)
+        a1_range, matrix = result
+        self.assertEqual(a1_range, "A1:B2")
+        self.assertEqual(matrix, values)
+        self.assertEqual(result.a1_range, "A1:B2")
+        self.assertEqual(result.range, "A1:B2")
+        self.assertEqual(result.values, values)
+        self.assertEqual(result.matrix, values)
+        self.assertEqual(result["range"], "A1:B2")
+        self.assertEqual(result["values"], values)
+        self.assertEqual(result.area, 4)
+        self.assertEqual(result.as_dict(), {"range": "A1:B2", "values": values})
+
+    def test_matches_exhaustive_search(self):
+        """Cross-check the search against a brute force over four boundaries."""
+
+        pattern = [
+            [True, False, False, True],
+            [False, False, True, False],
+            [True, False, False, False],
+        ]
+        excluded = [
+            [False, False, False, False],
+            [False, True, False, False],
+            [False, False, False, True],
+        ]
+        anchors = [(0, 0), (2, 1)]
+
+        for budget in (None, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9):
+            found = utils._search_bounded(
+                pattern,
+                excluded,
+                anchors,
+                float("inf") if budget is None else budget,
+            )
+            self.assertEqual(
+                found,
+                _exhaustive_bounded_search(pattern, excluded, anchors, budget),
+            )
+
+
+def _exhaustive_bounded_search(blank, excluded, anchors, budget):
+    """Reference implementation, enumerating all four boundaries.
+
+    Only used to cross-check :func:`gspread.utils._search_bounded`.
+    """
+    rows, cols = len(blank), len(blank[0])
+    best = None
+    for top in range(rows):
+        for bottom in range(top, rows):
+            for left in range(cols):
+                for right in range(left, cols):
+                    rectangle = _evaluate_rectangle(
+                        blank, excluded, anchors, budget, top, bottom, left, right
+                    )
+                    if rectangle is None:
+                        continue
+                    key, rect = rectangle
+                    if best is None or key < best[0]:
+                        best = (key, rect)
+    return best[1] if best else None
+
+
+def _evaluate_rectangle(blank, excluded, anchors, budget, top, bottom, left, right):
+    """Score one candidate rectangle, or return ``None`` when it is invalid."""
+    cells = [
+        (row, col) for row in range(top, bottom + 1) for col in range(left, right + 1)
+    ]
+    if any(excluded[row][col] for row, col in cells):
+        return None
+    if any(not (top <= row <= bottom and left <= col <= right) for row, col in anchors):
+        return None
+
+    blanks = sum(blank[row][col] for row, col in cells)
+    if budget is not None and blanks > budget:
+        return None
+
+    area = (bottom - top + 1) * (right - left + 1)
+    key = (-area, blanks, top, left, bottom, right)
+    return key, (top, left, bottom, right, blanks)
